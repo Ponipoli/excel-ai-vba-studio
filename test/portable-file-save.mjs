@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { build } from 'esbuild';
-import { mkdtemp, readFile, writeFile, chmod, stat, symlink, link, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, chmod, stat, symlink, link, readdir, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -10,6 +10,17 @@ import { pathToFileURL } from 'node:url';
 const root = resolve(import.meta.dirname, '..');
 const temp = await mkdtemp(join(tmpdir(), 'excel-portable-save-'));
 const digest = value => createHash('sha256').update(value).digest('hex');
+
+function windowsShortPath(directory) {
+  const result = spawnSync('cmd.exe', ['/d', '/s', '/c', 'for %I in ("%EXCEL_SYNTHETIC_DIRECTORY%") do @echo %~sI'], {
+    encoding: 'utf8', timeout: 10_000, windowsHide: true, windowsVerbatimArguments: true,
+    env: { ...process.env, EXCEL_SYNTHETIC_DIRECTORY: directory },
+  });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, `Synthetic Windows short-path query failed: ${result.stderr}`);
+  assert.ok(result.stdout.trim(), 'Windows short-path query must return a path');
+  return result.stdout.trim();
+}
 
 function syntheticAttributes(file, action) {
   const result = spawnSync('python3', ['-c', `
@@ -125,6 +136,36 @@ try {
     assert.deepEqual(await readFile(aclFile), edited, 'missing attribute helper must fail closed');
   } else {
     await assert.rejects(savePortableFile(file, edited, digest(original)), /qualified only on Linux/);
+    if (process.platform === 'win32') {
+      const canonicalTemp = await realpath(temp);
+      const directory = join(canonicalTemp, 'SyntheticCaseParent');
+      await mkdir(directory);
+      const caseAlias = join(canonicalTemp, 'sYNTHETICcASEpARENT');
+      const preservedName = 'PreserveCase.xlsx';
+      assert.equal(await createPortableFile(join(caseAlias, preservedName), edited), digest(edited));
+      assert.deepEqual(await readFile(join(directory, preservedName)), edited);
+      assert.ok((await readdir(directory)).includes(preservedName), 'canonicalizing a parent must preserve the requested filename');
+
+      const shortDirectory = windowsShortPath(directory);
+      assert.equal(await realpath(shortDirectory), await realpath(directory));
+      assert.equal(await createPortableFile(join(shortDirectory, 'short-alias.xlsx'), original), digest(original));
+      assert.deepEqual(await readFile(join(directory, 'short-alias.xlsx')), original);
+      console.log(`Windows synthetic paths: ${JSON.stringify({ lexicalTemp: temp, canonicalTemp, shortDirectory })}`);
+
+      const nested = join(directory, 'Nested');
+      await mkdir(nested);
+      const junction = join(canonicalTemp, 'synthetic-junction');
+      await symlink(directory, junction, 'junction');
+      await assert.rejects(createPortableFile(join(junction, 'Nested', 'refused.xlsx'), edited), /symbolic links or junctions/);
+      assert.deepEqual(await readdir(nested), [], 'an ancestor junction must not redirect the destination');
+
+      const backups = join(canonicalTemp, '.EXCEL-AI-VBA-BACKUPS');
+      await mkdir(backups);
+      await assert.rejects(createPortableFile(join(backups, 'new.xlsx'), edited), /Recovery backups/);
+      const shortBackups = windowsShortPath(backups);
+      await assert.rejects(createPortableFile(join(shortBackups, 'alias.xlsx'), edited), /Recovery backups/);
+      assert.deepEqual(await readdir(backups), [], 'recovery paths must remain protected through case and 8.3 aliases');
+    }
   }
   assert.deepEqual((await readdir(temp)).filter(name => name.startsWith('.excel-ai-save-')), []);
   console.log('Portable file save passed: exclusive create, staged replacement, recovery, ACL/xattr preservation, metadata-race and stale/link/read-only refusals.');

@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { constants, promises as fs } from 'node:fs';
 import type { BigIntStats } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
-import { dirname, extname, join, resolve } from 'node:path';
+import { basename, dirname, extname, join, parse, resolve } from 'node:path';
 
 const MAX_PORTABLE_FILE_BYTES = 128 * 1024 * 1024;
 const BACKUP_DIRECTORY = '.excel-ai-vba-backups';
@@ -31,14 +31,46 @@ function validateBytes(bytes: Uint8Array): void {
 async function localParent(filePath: string): Promise<string> {
     const fullPath = resolve(filePath);
     const parent = dirname(fullPath);
-    if (fullPath.split(/[\\/]/).includes(BACKUP_DIRECTORY)) {
+    if (containsRecoveryDirectory(fullPath)) {
         throw new Error('Recovery backups cannot be overwritten by the spreadsheet editor.');
+    }
+    if (process.platform === 'win32') {
+        // realpath expands legitimate 8.3 names and corrects directory casing.
+        // Inspect the original path first: canonicalization alone would hide a junction.
+        await assertWindowsDirectoryChain(parent);
+        const canonicalParent = await fs.realpath(parent);
+        await assertWindowsDirectoryChain(canonicalParent);
+        if (containsRecoveryDirectory(join(canonicalParent, basename(fullPath)))) {
+            throw new Error('Recovery backups cannot be overwritten by the spreadsheet editor.');
+        }
+        return canonicalParent;
     }
     // A different real parent would let a symlink redirect a staged replacement.
     if (!sameLocalPath(await fs.realpath(parent), parent)) {
         throw new Error('Portable saves require a local path without symbolic links.');
     }
     return parent;
+}
+
+function containsRecoveryDirectory(filePath: string): boolean {
+    return filePath.split(/[\\/]/).some(part => process.platform === 'win32'
+        ? part.toLowerCase() === BACKUP_DIRECTORY
+        : part === BACKUP_DIRECTORY);
+}
+
+async function assertWindowsDirectoryChain(directory: string): Promise<void> {
+    const root = parse(directory).root;
+    let current = root;
+    const segments = directory.slice(root.length).split(/[\\/]/).filter(Boolean);
+    // lstat reports Windows junctions as symbolic links. Include all ancestors,
+    // even when the immediate parent itself is an ordinary directory.
+    for (const segment of ['', ...segments]) {
+        if (segment) current = join(current, segment);
+        const info = await fs.lstat(current);
+        if (!info.isDirectory() || info.isSymbolicLink()) {
+            throw new Error('Portable saves require local directories without symbolic links or junctions.');
+        }
+    }
 }
 
 async function readStable(handle: FileHandle): Promise<Buffer> {
@@ -124,14 +156,18 @@ export async function createPortableFile(filePath: string, bytes: Uint8Array): P
     validateBytes(bytes);
     const fullPath = resolve(filePath);
     const parent = await localParent(fullPath);
+    const destination = process.platform === 'win32' ? join(parent, basename(fullPath)) : fullPath;
     const staging = await fs.mkdtemp(join(parent, '.excel-ai-save-'));
     const stagePath = join(staging, 'workbook');
     try {
         await writeExclusive(stagePath, bytes, 0o600);
+        if (process.platform === 'win32' && !sameLocalPath(await localParent(fullPath), parent)) {
+            throw new Error('Save destination changed.');
+        }
         if (!sameLocalPath(await fs.realpath(parent), parent)) throw new Error('Save destination changed.');
         // link(2) installs the complete file atomically and fails if the target exists.
         // Unlike rename, this can never clobber a destination created during Save As.
-        await fs.link(stagePath, fullPath);
+        await fs.link(stagePath, destination);
         return hash(bytes);
     } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'EEXIST') {

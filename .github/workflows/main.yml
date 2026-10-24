@@ -60,6 +60,10 @@ jobs:
       - name: Install locked dependencies
         run: npm ci
 
+      - name: Verify Windows portable creation paths and junction refusals
+        if: runner.os == 'Windows'
+        run: node test/portable-file-save.mjs
+
       - name: Build the platform VSIX
         run: npm run package -- --target ${{ matrix.target }}
 
