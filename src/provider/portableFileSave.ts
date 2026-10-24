@@ -1,11 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { constants, promises as fs } from 'node:fs';
+import type { BigIntStats } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
 import { dirname, extname, join, resolve } from 'node:path';
 
 const MAX_PORTABLE_FILE_BYTES = 128 * 1024 * 1024;
 const BACKUP_DIRECTORY = '.excel-ai-vba-backups';
 const pendingSaves = new Map<string, Promise<string>>();
+const ATTRIBUTE_COPY_TIMEOUT_MS = 10_000;
+const MAX_ATTRIBUTE_COPY_STDERR_BYTES = 8 * 1024;
 
 function sameLocalPath(left: string, right: string): boolean {
     // VS Code normalizes drive letters to lowercase; Windows realpath can return
@@ -38,11 +42,11 @@ async function localParent(filePath: string): Promise<string> {
 }
 
 async function readStable(handle: FileHandle): Promise<Buffer> {
-    const before = await handle.stat();
+    const before = await handle.stat({ bigint: true });
     if (!before.isFile() || before.size > MAX_PORTABLE_FILE_BYTES) {
         throw new Error('Spreadsheet source is not a regular file within the 128 MiB limit.');
     }
-    const bytes = Buffer.alloc(before.size);
+    const bytes = Buffer.alloc(Number(before.size));
     let offset = 0;
     while (offset < bytes.length) {
         const result = await handle.read(bytes, offset, bytes.length - offset, offset);
@@ -50,12 +54,59 @@ async function readStable(handle: FileHandle): Promise<Buffer> {
         offset += result.bytesRead;
     }
     const extra = await handle.read(Buffer.alloc(1), 0, 1, offset);
-    const after = await handle.stat();
-    if (extra.bytesRead || before.size !== after.size || before.mtimeMs !== after.mtimeMs
-        || before.ctimeMs !== after.ctimeMs) {
+    const after = await handle.stat({ bigint: true });
+    if (extra.bytesRead || !sameSourceState(before, after)) {
         throw new Error('Spreadsheet changed while it was being read.');
     }
     return bytes;
+}
+
+function sameSourceState(left: BigIntStats, right: BigIntStats): boolean {
+    return left.dev === right.dev && left.ino === right.ino
+        && left.size === right.size && left.nlink === right.nlink
+        && left.mode === right.mode && left.uid === right.uid && left.gid === right.gid
+        && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+
+async function preserveLinuxAttributes(source: FileHandle, stagePath: string): Promise<void> {
+    // POSIX mode bits expose an ACL's mask, not its owning-group permissions.
+    // chmod alone can therefore grant access which the original ACL denied.
+    // GNU cp preserves ACLs with mode and copies xattrs without changing bytes.
+    await new Promise<void>((resolvePromise, reject) => {
+        const child = spawn('/usr/bin/cp', [
+            '--attributes-only', '--preserve=mode,ownership,xattr', '--no-target-directory',
+            '--', '/proc/self/fd/3', stagePath,
+        ], {
+            shell: false,
+            stdio: ['ignore', 'ignore', 'pipe', source.fd],
+        });
+        let failed = false;
+        let stderrBytes = 0;
+        const timeout = setTimeout(() => {
+            failed = true;
+            child.kill('SIGKILL');
+        }, ATTRIBUTE_COPY_TIMEOUT_MS);
+        child.on('error', () => { failed = true; });
+        child.stderr?.on('data', (chunk: Buffer) => {
+            stderrBytes += chunk.byteLength;
+            if (stderrBytes > MAX_ATTRIBUTE_COPY_STDERR_BYTES) {
+                failed = true;
+                child.kill('SIGKILL');
+            }
+        });
+        // Wait for close even after error/timeout: never rename while cp runs.
+        child.once('close', (code, signal) => {
+            clearTimeout(timeout);
+            if (failed || code !== 0 || signal || stderrBytes !== 0) {
+                reject(new Error(
+                    'Linux save could not preserve filesystem permissions and attributes. '
+                    + 'GNU coreutils /usr/bin/cp is required; the original file was not replaced.',
+                ));
+            } else {
+                resolvePromise();
+            }
+        });
+    });
 }
 
 async function writeExclusive(filePath: string, bytes: Uint8Array, mode: number): Promise<void> {
@@ -93,7 +144,7 @@ export async function createPortableFile(filePath: string, bytes: Uint8Array): P
 }
 
 /**
- * POSIX staged save tied to the bytes last delivered by the host. Windows uses
+ * Linux staged save tied to the bytes last delivered by the host. Windows uses
  * its existing file writer so NTFS origin streams are not lost by a POSIX rename.
  * The recovery copy preserves the previous bytes even if a later writer races us.
  */
@@ -118,24 +169,27 @@ async function savePortableFileUnlocked(
     bytes: Uint8Array,
     expectedSha256: string,
 ): Promise<string> {
+    if (process.platform !== 'linux') {
+        throw new Error('Staged workbook replacement is qualified only on Linux.');
+    }
     validateBytes(bytes);
     if (!/^[a-f0-9]{64}$/.test(expectedSha256)) {
         throw new Error('Reload this spreadsheet before saving: its source snapshot is missing.');
     }
     const fullPath = resolve(filePath);
     const parent = await localParent(fullPath);
-    const initial = await fs.lstat(fullPath);
-    if (!initial.isFile() || initial.isSymbolicLink() || initial.nlink !== 1) {
+    const initial = await fs.lstat(fullPath, { bigint: true });
+    if (!initial.isFile() || initial.isSymbolicLink() || initial.nlink !== 1n) {
         throw new Error('Portable saves require a regular file without symbolic or hard links.');
     }
-    if ((initial.mode & 0o222) === 0) throw new Error('This spreadsheet is read-only.');
+    if ((initial.mode & 0o222n) === 0n) throw new Error('This spreadsheet is read-only.');
     const source = await fs.open(fullPath, constants.O_RDONLY | constants.O_NOFOLLOW);
     let staging: string | undefined;
     let recoveryPath: string | undefined;
     let committed = false;
     try {
-        const opened = await source.stat();
-        if (opened.dev !== initial.dev || opened.ino !== initial.ino) {
+        const opened = await source.stat({ bigint: true });
+        if (!sameSourceState(opened, initial)) {
             throw new Error('Spreadsheet was replaced before saving. Reload it first.');
         }
         const previousBytes = await readStable(source);
@@ -145,11 +199,7 @@ async function savePortableFileUnlocked(
         staging = await fs.mkdtemp(join(parent, '.excel-ai-save-'));
         const stagePath = join(staging, 'workbook');
         await writeExclusive(stagePath, bytes, 0o600);
-        const stageInfo = await fs.stat(stagePath);
-        if (stageInfo.uid !== initial.uid || stageInfo.gid !== initial.gid) {
-            await fs.chown(stagePath, initial.uid, initial.gid);
-        }
-        await fs.chmod(stagePath, initial.mode & 0o777);
+        await preserveLinuxAttributes(source, stagePath);
 
         const backups = join(parent, BACKUP_DIRECTORY);
         await fs.mkdir(backups, { mode: 0o700 }).catch(error => {
@@ -163,10 +213,11 @@ async function savePortableFileUnlocked(
         recoveryPath = join(backups, `portable-${Date.now()}-${randomUUID()}${extname(fullPath).slice(0, 16)}`);
         await writeExclusive(recoveryPath, previousBytes, 0o600);
 
-        const current = await fs.lstat(fullPath);
-        if (current.dev !== initial.dev || current.ino !== initial.ino || current.nlink !== 1
-            || current.mode !== initial.mode || current.uid !== initial.uid || current.gid !== initial.gid
-            || await fs.realpath(parent) !== parent || hash(await readStable(source)) !== expectedSha256) {
+        const currentHash = hash(await readStable(source));
+        const currentParent = await fs.realpath(parent);
+        const current = await fs.lstat(fullPath, { bigint: true });
+        if (!sameSourceState(current, initial) || currentParent !== parent
+            || currentHash !== expectedSha256) {
             throw new Error('Spreadsheet changed during saving. Reload it before trying again.');
         }
         await fs.rename(stagePath, fullPath);

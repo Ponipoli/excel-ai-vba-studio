@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { build } from 'esbuild';
 import { mkdtemp, readFile, writeFile, chmod, stat, symlink, link, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -9,6 +10,53 @@ import { pathToFileURL } from 'node:url';
 const root = resolve(import.meta.dirname, '..');
 const temp = await mkdtemp(join(tmpdir(), 'excel-portable-save-'));
 const digest = value => createHash('sha256').update(value).digest('hex');
+
+function syntheticAttributes(file, action) {
+  const result = spawnSync('python3', ['-c', `
+import json, os, stat, struct, sys
+path, action = sys.argv[1:]
+if action == 'set':
+    # st_mode reports ACL mask=r although the owning group has no access.
+    entries = [(1, 6, 0xffffffff), (2, 4, os.getuid() + 1),
+               (4, 0, 0xffffffff), (16, 4, 0xffffffff), (32, 0, 0xffffffff)]
+    acl = struct.pack('<I', 2) + b''.join(struct.pack('<HHI', *entry) for entry in entries)
+    os.setxattr(path, 'system.posix_acl_access', acl)
+    os.setxattr(path, 'user.excel-synthetic-test', b'preserve synthetic metadata')
+info = os.stat(path)
+print(json.dumps({'mode': stat.S_IMODE(info.st_mode), 'uid': info.st_uid, 'gid': info.st_gid,
+                  'acl': os.getxattr(path, 'system.posix_acl_access').hex(),
+                  'xattr': os.getxattr(path, 'user.excel-synthetic-test').hex()}))
+`, file, action], { encoding: 'utf8', timeout: 10_000, maxBuffer: 8192 });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, `Synthetic ACL fixture failed: ${result.stderr}`);
+  return JSON.parse(result.stdout);
+}
+
+async function loadSaveWithSpawnWrapper(temp, behavior) {
+  const output = join(temp, `save-${behavior}.mjs`);
+  await build({
+    entryPoints: [join(root, 'src/provider/portableFileSave.ts')], outfile: output,
+    bundle: true, format: 'esm', platform: 'node', logLevel: 'silent',
+    plugins: [{ name: 'synthetic-cp-boundary', setup(api) {
+      api.onResolve({ filter: /^node:child_process$/ }, () => ({ path: 'child-process', namespace: 'test' }));
+      api.onLoad({ filter: /.*/, namespace: 'test' }, () => ({ loader: 'js', contents: `
+        import { createRequire } from 'node:module';
+        import { fchmodSync, fstatSync } from 'node:fs';
+        const realSpawn = createRequire(import.meta.url)('node:child_process').spawn;
+        export function spawn(command, args, options) {
+          const child = realSpawn(${behavior === 'unavailable' ? "'/nonexistent-excel-synthetic-cp'" : 'command'}, args, options);
+          ${behavior === 'metadata-race' ? `child.once('close', () => {
+            // Change ctime without changing bytes, uid/gid or the mode value.
+            const fd = options.stdio[3];
+            fchmodSync(fd, fstatSync(fd).mode & 0o777);
+          });` : ''}
+          return child;
+        }
+      ` }));
+    } }],
+  });
+  return import(pathToFileURL(output).href);
+}
 try {
   const compiled = join(temp, 'save.mjs');
   await build({ entryPoints: [join(root, 'src/provider/portableFileSave.ts')], outfile: compiled,
@@ -20,8 +68,8 @@ try {
   assert.equal(await createPortableFile(file, original), digest(original));
   await assert.rejects(createPortableFile(file, edited), /already exists/);
   assert.deepEqual(await readFile(file), original);
-  // Staging logic is POSIX-specific; Windows keeps the NTFS-preserving writer.
-  if (process.platform !== 'win32') {
+  // Linux uses GNU cp for ACL/xattr preservation; Windows keeps its own writer.
+  if (process.platform === 'linux') {
     await chmod(file, 0o640);
     assert.equal(await savePortableFile(file, edited, digest(original)), digest(edited));
     assert.deepEqual(await readFile(file), edited);
@@ -54,9 +102,32 @@ try {
     ]);
     assert.ok(results.some(result => result.status === 'fulfilled'));
     assert.ok(results.some(result => result.status === 'rejected'), 'stale parallel save must be rejected');
+
+    const aclFile = join(temp, 'synthetic-acl.xlsx');
+    await createPortableFile(aclFile, original);
+    const attributes = syntheticAttributes(aclFile, 'set');
+    assert.equal(attributes.mode, 0o640, 'the ACL mask must reproduce the old chmod-only widening case');
+    assert.equal(await savePortableFile(aclFile, edited, digest(original)), digest(edited));
+    assert.deepEqual(syntheticAttributes(aclFile, 'inspect'), attributes,
+      'real GNU cp must preserve exact ACL/xattr bytes and ownership');
+    assert.deepEqual(await readFile(aclFile), edited, 'attribute copying must preserve replacement content');
+
+    const race = await loadSaveWithSpawnWrapper(temp, 'metadata-race');
+    const beforeRace = await stat(aclFile, { bigint: true });
+    await assert.rejects(race.savePortableFile(aclFile, original, digest(edited)), /changed during saving/);
+    const afterRace = await stat(aclFile, { bigint: true });
+    assert.equal(afterRace.mtimeNs, beforeRace.mtimeNs);
+    assert.notEqual(afterRace.ctimeNs, beforeRace.ctimeNs, 'test must exercise a metadata-only change');
+    assert.deepEqual(await readFile(aclFile), edited, 'metadata drift must leave the source content intact');
+
+    const unavailable = await loadSaveWithSpawnWrapper(temp, 'unavailable');
+    await assert.rejects(unavailable.savePortableFile(aclFile, original, digest(edited)), /could not preserve filesystem/);
+    assert.deepEqual(await readFile(aclFile), edited, 'missing attribute helper must fail closed');
+  } else {
+    await assert.rejects(savePortableFile(file, edited, digest(original)), /qualified only on Linux/);
   }
   assert.deepEqual((await readdir(temp)).filter(name => name.startsWith('.excel-ai-save-')), []);
-  console.log('Portable file save passed: exclusive create, staged replacement, recovery, mode preservation and stale/link/read-only refusals.');
+  console.log('Portable file save passed: exclusive create, staged replacement, recovery, ACL/xattr preservation, metadata-race and stale/link/read-only refusals.');
 } finally {
   await rm(temp, { recursive: true, force: true });
 }
