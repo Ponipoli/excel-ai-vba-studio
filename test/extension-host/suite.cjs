@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const { readFile, writeFile } = require('node:fs/promises');
+const { readFile, writeFile, realpath } = require('node:fs/promises');
 const { join, relative, isAbsolute, sep } = require('node:path');
 const vscode = require('vscode');
 const JSZip = require('jszip');
@@ -83,16 +83,45 @@ function isSyntheticTab(tab, workspace) {
   return local !== '' && local !== '..' && !local.startsWith(`..${sep}`) && !isAbsolute(local);
 }
 
-async function captureFailure(browser, error) {
+async function visibleNotifications(browser) {
+  const notifications = [];
+  for (const context of browser.contexts()) {
+    for (const page of context.pages()) {
+      for (const item of await page.locator('.notification-list-item').all()) {
+        if (!await item.isVisible()) continue;
+        notifications.push({
+          message: await item.locator('.notification-list-item-message').innerText({ timeout: 1_000 }),
+          error: await item.locator('.codicon-error').count() > 0,
+        });
+      }
+    }
+  }
+  return notifications;
+}
+
+async function quickInputState(page) {
+  const input = page.locator('.quick-input-widget .quick-input-box input').first();
+  const present = await input.count() > 0;
+  const visible = present && await input.isVisible();
+  const value = present ? await input.inputValue({ timeout: 1_000 }).catch(() => undefined) : undefined;
+  return { present, visible, visibleValue: visible ? value : undefined, hiddenDomValue: visible ? undefined : value };
+}
+
+async function captureFailure(browser, error, contextInfo) {
   const prefix = join(process.env.EXCEL_SMOKE_SCREENSHOTS, `${process.platform}-${process.arch}-vscode-${vscode.version}-failure`);
-  const diagnostic = { error: error.stack || String(error), tabs: vscode.window.tabGroups.all.flatMap(group => group.tabs.map(tab => ({ label: tab.label, dirty: tab.isDirty }))), pages: [] };
+  const diagnostic = { error: error.stack || String(error), ...contextInfo, tabs: vscode.window.tabGroups.all.flatMap(group => group.tabs.map(tab => ({ label: tab.label, dirty: tab.isDirty, uri: tab.input?.uri?.toString() }))), pages: [] };
   for (const context of browser.contexts()) {
     for (const page of context.pages()) {
       if (!await page.locator('.monaco-workbench').isVisible()) continue;
+      // Showing notification history can change focus: record visibility first.
+      const quickInputBeforeNotificationCenter = await quickInputState(page);
+      await step('show notification history', () => vscode.commands.executeCommand('notifications.showList'), 2_000)
+        .catch(error => { diagnostic.notificationCenterError = error.message; });
       diagnostic.pages.push({
         notifications: await page.locator('.notification-list-item-message').allTextContents(),
         dialogs: await page.locator('.monaco-dialog-box').allTextContents(),
-        quickInput: await page.locator('.quick-input-widget .quick-input-box input').inputValue({ timeout: 1_000 }).catch(() => undefined),
+        quickInputBeforeNotificationCenter,
+        quickInputAfterNotificationCenter: await quickInputState(page),
       });
       await page.screenshot({ path: `${prefix}.png`, timeout: 3_000 }).catch(error => { diagnostic.screenshotError = error.message; });
       break;
@@ -125,6 +154,11 @@ exports.run = async function run() {
   const workspace = process.env.EXCEL_SMOKE_WORKSPACE;
   assert.ok(workspace, 'synthetic workspace must be provided');
   const actualWorkspace = vscode.workspace.workspaceFolders[0].uri.fsPath;
+  const contextInfo = {
+    workspace: { lexical: workspace, canonical: await realpath(workspace), uri: vscode.workspace.workspaceFolders[0].uri.toString(), uriFsPath: actualWorkspace },
+    notificationsDuringCreation: [],
+  };
+  console.log(`[smoke] Synthetic workspace paths: ${JSON.stringify(contextInfo.workspace)}`);
   // VS Code normalizes Windows drive-letter casing in URI.fsPath.
   assert.equal(
     process.platform === 'win32' ? actualWorkspace.toLowerCase() : actualWorkspace,
@@ -174,7 +208,28 @@ exports.run = async function run() {
     await closeEditors();
 
     const createdPath = join(workspace, 'created-through-command.xlsx');
-    await step('create workbook through save dialog', async () => {
+    contextInfo.expectedTarget = { path: createdPath, uri: vscode.Uri.file(createdPath).toString() };
+    const oldErrors = new Set((await visibleNotifications(browser)).filter(item => item.error).map(item => item.message));
+    let rejectNotification;
+    const notificationFailure = new Promise((_, reject) => { rejectNotification = reject; });
+    notificationFailure.catch(() => {});
+    let inspectingNotifications = false;
+    const notificationTimer = setInterval(async () => {
+      if (inspectingNotifications) return;
+      inspectingNotifications = true;
+      try {
+        for (const notice of await visibleNotifications(browser)) {
+          if (!contextInfo.notificationsDuringCreation.some(item => item.message === notice.message)) {
+            contextInfo.notificationsDuringCreation.push(notice);
+            console.log(`[smoke] Notification during creation: ${JSON.stringify(notice)}`);
+          }
+          if (notice.error && !oldErrors.has(notice.message)) rejectNotification(new Error(`New workbook error notification: ${notice.message}`));
+        }
+      } catch (error) { contextInfo.notificationInspectionError = error.message; }
+      finally { inspectingNotifications = false; }
+    }, 100);
+    try {
+      await step('create workbook through save dialog', () => Promise.race([notificationFailure, (async () => {
       const creation = Promise.resolve(vscode.commands.executeCommand('excelAiVbaStudio.newWorkbook'));
       // Observe an early rejection while the save-dialog locator is still waiting.
       creation.catch(() => {});
@@ -188,9 +243,12 @@ exports.run = async function run() {
         return null;
       }, 'new workbook save dialog', 25_000);
       await filename.fill(createdPath, { timeout: 5_000 });
+      contextInfo.dialogInputAtSubmit = { visible: await filename.isVisible(), value: await filename.inputValue() };
+      console.log(`[smoke] New workbook dialog input: ${JSON.stringify(contextInfo.dialogInputAtSubmit)}`);
       await filename.press('Enter', { timeout: 5_000 });
       await creation;
-    });
+      })()]));
+    } finally { clearInterval(notificationTimer); }
     frame = await spreadsheetFrame(browser);
     await setCell(frame, 'A1', 'created-in-vscode');
     await until(() => vscode.window.tabGroups.activeTabGroup.activeTab?.isDirty, 'new workbook dirty event');
@@ -238,7 +296,7 @@ exports.run = async function run() {
     }
   } catch (error) {
     failure = error;
-    await step('capture failure diagnostics', () => captureFailure(browser, error), 8_000).catch(() => {});
+    await step('capture failure diagnostics', () => captureFailure(browser, error, contextInfo), 8_000).catch(() => {});
   } finally {
     try { await cleanupSyntheticEditors(workspace); } catch (error) { failure ||= error; }
     try { await step('disconnect test browser', () => browser.close(), 5_000); } catch (error) { failure ||= error; }
