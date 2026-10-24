@@ -140,6 +140,7 @@ export default {
     tooltip: 'Tooltip',
   },
   viewer: {
+    portableReadonlyBanner: 'Read-only: this workbook contains features that the portable editor cannot safely preserve. Use Excel Desktop on Windows to edit it.',
     saveSuccess: 'Save done',
     protectedCell: 'Protected cells do not support this function',
     readonlyBanner: 'Read-only — browse and find; use Save As to save changes',
