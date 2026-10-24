@@ -15,6 +15,7 @@ $source = Join-Path $root 'native\vba-writeback\cli.py'
 $requirements = Join-Path $root 'native\vba-writeback\requirements.lock'
 $outputDirectory = Join-Path $root 'bin\win32-x64'
 $outputPath = Join-Path $outputDirectory 'excel-ai-vba-writeback.exe'
+$provenancePath = Join-Path $outputDirectory 'excel-ai-vba-writeback.provenance.json'
 $buildRoot = Join-Path ([IO.Path]::GetTempPath()) (
     'excel-ai-vba-writeback-build-' + [Guid]::NewGuid().ToString('N')
 )
@@ -84,6 +85,18 @@ try {
         throw 'The built VBA write-back executable failed its smoke test.'
     }
     $hash = Get-Sha256 $outputPath
+    $sourceHash = Get-Sha256 $source
+    $provenance = [ordered]@{
+        schemaVersion = 1
+        sourceSha256 = $sourceHash.ToLowerInvariant()
+        executableSha256 = $hash.ToLowerInvariant()
+        pythonVersion = '3.11.9'
+    } | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText(
+        $provenancePath,
+        $provenance + [Environment]::NewLine,
+        [Text.UTF8Encoding]::new($false)
+    )
     [Console]::Out.WriteLine("VBA_WRITEBACK_EXE|$outputPath")
     [Console]::Out.WriteLine("SHA256|$hash")
 }
