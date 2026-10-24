@@ -31,6 +31,11 @@ function sha256(path) {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
 }
 
+function canonicalTextSha256(path) {
+  const canonicalText = readFileSync(path, 'utf8').replace(/\r\n?/g, '\n');
+  return createHash('sha256').update(canonicalText, 'utf8').digest('hex');
+}
+
 assert.match(cli, /expectedWorkbookSha256/, 'stale workbook hash gate is missing');
 assert.match(cli, /detect_signature/, 'signed project gate is missing');
 assert.match(cli, /has_password/, 'protected project gate is missing');
@@ -96,7 +101,7 @@ assert.equal(provenance.schemaVersion, 1, 'native helper provenance schema is un
 assert.equal(provenance.pythonVersion, '3.11.9', 'native helper Python version is inconsistent');
 assert.equal(
   provenance.sourceSha256,
-  sha256(resolve(root, 'native/vba-writeback/cli.py')),
+  canonicalTextSha256(resolve(root, 'native/vba-writeback/cli.py')),
   'bundled helper was not built from the current native source',
 );
 assert.equal(
