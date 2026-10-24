@@ -1,9 +1,28 @@
 const assert = require('node:assert/strict');
 const { readFile, writeFile } = require('node:fs/promises');
-const { join } = require('node:path');
+const { join, relative, isAbsolute, sep } = require('node:path');
 const vscode = require('vscode');
 const JSZip = require('jszip');
 const { chromium } = require('playwright-core');
+
+async function step(label, action, timeout = 30_000) {
+  const started = Date.now();
+  console.log(`[smoke] START ${label}`);
+  let timer;
+  try {
+    const result = await Promise.race([
+      Promise.resolve().then(action),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Timed out after ${timeout}ms: ${label}`)), timeout); }),
+    ]);
+    console.log(`[smoke] PASS ${label} (${Date.now() - started}ms)`);
+    return result;
+  } catch (error) {
+    console.error(`[smoke] FAIL ${label}: ${error.message}`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function until(check, label, timeout = 60_000) {
   const deadline = Date.now() + timeout;
@@ -47,12 +66,58 @@ async function setCell(frame, address, value) {
 }
 
 async function openWorkbook(browser, filePath) {
-  await vscode.commands.executeCommand('vscode.openWith', vscode.Uri.file(filePath), 'excelAiVbaStudio.officeViewer');
+  await step('open workbook custom editor', () => vscode.commands.executeCommand('vscode.openWith', vscode.Uri.file(filePath), 'excelAiVbaStudio.officeViewer'));
   return spreadsheetFrame(browser);
 }
 
 async function closeEditors() {
-  await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+  assert.equal(vscode.window.tabGroups.all.some(group => group.tabs.some(tab => tab.isDirty)), false,
+    'an expected save did not finish; do not open an interactive save prompt during cleanup');
+  await step('close saved editors', () => vscode.commands.executeCommand('workbench.action.closeAllEditors'), 10_000);
+}
+
+function isSyntheticTab(tab, workspace) {
+  const uri = tab.input?.uri;
+  if (uri?.scheme !== 'file') return false;
+  const local = relative(workspace, uri.fsPath);
+  return local !== '' && local !== '..' && !local.startsWith(`..${sep}`) && !isAbsolute(local);
+}
+
+async function captureFailure(browser, error) {
+  const prefix = join(process.env.EXCEL_SMOKE_SCREENSHOTS, `${process.platform}-${process.arch}-vscode-${vscode.version}-failure`);
+  const diagnostic = { error: error.stack || String(error), tabs: vscode.window.tabGroups.all.flatMap(group => group.tabs.map(tab => ({ label: tab.label, dirty: tab.isDirty }))), pages: [] };
+  for (const context of browser.contexts()) {
+    for (const page of context.pages()) {
+      if (!await page.locator('.monaco-workbench').isVisible()) continue;
+      diagnostic.pages.push({
+        notifications: await page.locator('.notification-list-item-message').allTextContents(),
+        dialogs: await page.locator('.monaco-dialog-box').allTextContents(),
+        quickInput: await page.locator('.quick-input-widget .quick-input-box input').inputValue({ timeout: 1_000 }).catch(() => undefined),
+      });
+      await page.screenshot({ path: `${prefix}.png`, timeout: 3_000 }).catch(error => { diagnostic.screenshotError = error.message; });
+      break;
+    }
+  }
+  await writeFile(`${prefix}.json`, JSON.stringify(diagnostic, null, 2));
+  console.error(`[smoke] Failure diagnostics: ${JSON.stringify(diagnostic)}`);
+}
+
+async function cleanupSyntheticEditors(workspace) {
+  await step('dismiss test dialogs and notifications', async () => {
+    await vscode.commands.executeCommand('workbench.action.closeQuickOpen');
+    await vscode.commands.executeCommand('notifications.clearAll');
+  }, 5_000);
+  const tabs = vscode.window.tabGroups.all.flatMap(group => group.tabs).filter(tab => isSyntheticTab(tab, workspace));
+  for (const tab of tabs) {
+    await step(`discard synthetic editor ${tab.label}`, async () => {
+      if (tab.isDirty) {
+        await vscode.commands.executeCommand('vscode.openWith', tab.input.uri, 'excelAiVbaStudio.officeViewer');
+        await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+      } else {
+        await vscode.window.tabGroups.close(tab);
+      }
+    }, 5_000);
+  }
 }
 
 exports.run = async function run() {
@@ -68,7 +133,7 @@ exports.run = async function run() {
   const extension = vscode.extensions.getExtension('steph-tools.excel-ai-vba-studio');
   assert.ok(extension, 'the VSIX must be installed in the isolated profile');
   assert.ok(!extension.extensionPath.includes(join('test', 'extension-host')), 'test the installed product');
-  await extension.activate();
+  await step('activate installed extension', () => extension.activate());
   assert.equal(extension.isActive, true);
   const commands = await vscode.commands.getCommands(true);
   assert.ok(commands.includes('excelAiVbaStudio.newWorkbook'), 'new-workbook command must be registered');
@@ -80,7 +145,8 @@ exports.run = async function run() {
   const path = join(workspace, 'portable-smoke.xlsx');
   await writeFile(path, Buffer.from(await workbook.xlsx.writeBuffer()));
   const original = await readFile(path);
-  const browser = await chromium.connectOverCDP(process.env.EXCEL_SMOKE_CDP_ENDPOINT);
+  const browser = await step('connect to VS Code UI', () => chromium.connectOverCDP(process.env.EXCEL_SMOKE_CDP_ENDPOINT, { timeout: 15_000 }));
+  let failure;
   try {
     let frame = await openWorkbook(browser, path);
     assert.equal(await frame.locator('.excel-load-error').count(), 0);
@@ -89,7 +155,7 @@ exports.run = async function run() {
     await setCell(frame, 'A1', 'portable-edited');
     await setCell(frame, 'B1', '=SUM(2,3)');
     await until(() => vscode.window.tabGroups.activeTabGroup.activeTab?.isDirty, 'custom editor dirty event');
-    await vscode.commands.executeCommand('workbench.action.files.save');
+    await step('save edited workbook', () => vscode.commands.executeCommand('workbench.action.files.save'));
     await until(async () => {
       if (vscode.window.tabGroups.activeTabGroup.activeTab?.isDirty) return false;
       return !(await readFile(path)).equals(original);
@@ -108,23 +174,27 @@ exports.run = async function run() {
     await closeEditors();
 
     const createdPath = join(workspace, 'created-through-command.xlsx');
-    const creation = vscode.commands.executeCommand('excelAiVbaStudio.newWorkbook');
-    const filename = await until(async () => {
-      for (const context of browser.contexts()) {
-        for (const page of context.pages()) {
-          const input = page.locator('.quick-input-widget .quick-input-box input');
-          if (await input.isVisible()) return input;
+    await step('create workbook through save dialog', async () => {
+      const creation = Promise.resolve(vscode.commands.executeCommand('excelAiVbaStudio.newWorkbook'));
+      // Observe an early rejection while the save-dialog locator is still waiting.
+      creation.catch(() => {});
+      const filename = await until(async () => {
+        for (const context of browser.contexts()) {
+          for (const page of context.pages()) {
+            const input = page.locator('.quick-input-widget .quick-input-box input');
+            if (await input.isVisible()) return input;
+          }
         }
-      }
-      return null;
-    }, 'new workbook save dialog');
-    await filename.fill(createdPath);
-    await filename.press('Enter');
-    await creation;
+        return null;
+      }, 'new workbook save dialog', 25_000);
+      await filename.fill(createdPath, { timeout: 5_000 });
+      await filename.press('Enter', { timeout: 5_000 });
+      await creation;
+    });
     frame = await spreadsheetFrame(browser);
     await setCell(frame, 'A1', 'created-in-vscode');
     await until(() => vscode.window.tabGroups.activeTabGroup.activeTab?.isDirty, 'new workbook dirty event');
-    await vscode.commands.executeCommand('workbench.action.files.save');
+    await step('save newly created workbook', () => vscode.commands.executeCommand('workbench.action.files.save'));
     await until(() => !vscode.window.tabGroups.activeTabGroup.activeTab?.isDirty, 'new workbook save');
     const created = new ExcelJS.Workbook();
     await created.xlsx.load(await readFile(createdPath));
@@ -166,9 +236,13 @@ exports.run = async function run() {
       await closeEditors();
       assert.deepEqual(await readFile(macroPath), before, 'read-only workbook bytes must be unchanged');
     }
-    console.log('Installed VSIX smoke passed: activation, custom editor rendering, cell/formula edit, host save, disk verification, reopen, new-workbook command, and portable macro protection.');
+  } catch (error) {
+    failure = error;
+    await step('capture failure diagnostics', () => captureFailure(browser, error), 8_000).catch(() => {});
   } finally {
-    await closeEditors();
-    await browser.close();
+    try { await cleanupSyntheticEditors(workspace); } catch (error) { failure ||= error; }
+    try { await step('disconnect test browser', () => browser.close(), 5_000); } catch (error) { failure ||= error; }
   }
+  if (failure) throw failure;
+  console.log('Installed VSIX smoke passed: activation, custom editor rendering, cell/formula edit, host save, disk verification, reopen, new-workbook command, and portable macro protection.');
 };

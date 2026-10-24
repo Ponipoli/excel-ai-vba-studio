@@ -75,12 +75,13 @@ jobs:
         env:
           VSCODE_TEST_VERSION: ${{ matrix.vscode }}
 
-      - name: Retain the synthetic editor screenshot
+      - name: Retain synthetic editor screenshots and failure diagnostics
+        if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: editor-smoke-${{ matrix.target }}-${{ matrix.vscode }}
-          path: output/extension-host/*.png
-          if-no-files-found: error
+          path: output/extension-host/
+          if-no-files-found: warn
           retention-days: 7
 
   vba-writeback-windows:
